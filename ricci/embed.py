@@ -1,4 +1,4 @@
-"""Shape from metric: embed edge lengths into R^3.
+"""Embed edge lengths into R^3.
 
 Given target edge lengths (e.g. from Ricci flow), find vertex positions
 in 3D that realise those lengths subject to boundary, convexity, and
