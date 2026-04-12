@@ -1,185 +1,185 @@
-Metric deformation by Ricci flow
-==========
-written by S. Kaji
-based on the [code](https://github.com/hchapman/ricci-flow) written by Harrison Chapman.
+# ricci — Discrete Ricci Flow on Triangle Meshes
 
-See our paper
-- S. Kaji and J. Zhang, Free-form Design of Discrete Architectural Surfaces by use of Circle Packing, [arXiv:2103.07584](https://arxiv.org/abs/2103.07584)
+Design surfaces with prescribed Gaussian curvature via circle packing Ricci flow.
 
-This program takes 
-- a surface mesh (in .obj or .ply format)
-- a specification of Gaussian curvature (angle defect) for each vertex
-- boundary conditions
-- a conformal class specified by circle packing or by the inigial mesh
+Based on: S. Kaji and J. Zhang, *Free-form Design of Discrete Architectural Surfaces by use of Circle Packing*, [arXiv:2103.07584](https://arxiv.org/abs/2103.07584).
+Original Ricci flow code by [Harrison Chapman](https://github.com/hchapman/ricci-flow).
 
-and produces a surface mesh meeting the conditions.
+## Installation
 
-In contrast to usual implementations of Ricci flow based geometry processing,
-this code directly optimises an anpproximate Ricci energy, and hence, offers a flexibility of
-incorpolating various constraints as loss terms.
-Also, as our scheme is based on a simple optimisation problem of a scalar function,
-any advanced optimisers can be easily utilised.
+```
+pip install numpy scipy torch plyfile matplotlib seaborn
+```
 
-# Requirements
+## Quick start
 
-- Python 3: [Anaconda](https://anaconda.org) is recommended
-- plyfile installed by
+```python
+from ricci import TriangleMesh, ricci_flow, embed
 
-    pip install plyfile
+mesh = TriangleMesh.from_ply('demo/dome.ply')
+result = ricci_flow(mesh, target_curvature=0.1, fix_boundary=True)
+embedded = embed(mesh, result.edge_lengths)
+embedded.mesh.save_ply('result.ply')
+```
 
-# How to use
+See `examples.ipynb` for a full walkthrough.
 
-## with free boundary and specified target curvatures for each vertex
+## Pipeline
 
-    python ricci_flow.py dome.ply -K dome_targetK_hat.csv --gtol 1e-6 -op trf
+The approach splits surface design into two stages:
 
-reads mesh from dome.ply and target vertex curvatures from dome_targetK_hat.csv and performs Ricci flow.
-(for vertices with target curvature > 2pi or with no specified target curvature values, the target curvatures are inferred by the Gauss-Bonnet theorem).
-The trf optimiser with gtol 1e-6 is used (see scipy.optimize).
+1. **Ricci flow** (`ricci_flow`) — find edge lengths producing target Gaussian curvatures, preserving the conformal class.
+2. **Embedding** (`embed`) — find 3D vertex positions realising those edge lengths.
 
-Each row of dome_targetK_hat.csv consists:
+This factoring separates the convex (metric) and non-convex (embedding) parts of the problem. An alternative single-stage approach is also available via `curvature_flow`.
 
-    i, Guassian curvature of vertex i
+## API reference
 
+### `ricci_flow(mesh, target_curvature, **opts) -> RicciFlowResult`
 
-The output result/dome_edge.csv contains edge length per line:
+Find edge lengths achieving target Gaussian curvatures.
 
-    i,  j,  length of edge connecting vertex i and j
+| Parameter | Default | Description |
+|---|---|---|
+| `target_curvature` | `0.0` | `float` (uniform), `ndarray` (per-vertex), or CSV path |
+| `method` | `'trf'` | `'sgd'`, `'newton'`, `'lm'`, `'trf'` |
+| `scheme` | `'combinatorial'` | `'inversive'`, `'thurston'`, `'thurston2'`, `'combinatorial'`, `float`, or CSV path |
+| `fix_boundary` | `False` | keep boundary radii unchanged |
+| `boundary_constraint` | `'edge'` | `'edge'` or `'radius'` |
+| `boundary_weight` | `0.01` | weight for boundary constraints |
+| `gtol` | `1e-6` | convergence tolerance |
 
-The PLY file result/dome.ply is same as the (non-deformed) original mesh. 
-These two files are then passed to 
+Returns `RicciFlowResult` with `.edge_lengths`, `.curvature`, `.target_curvature`, `.scale_factor`, `.history`.
 
-    python metric_embed.py result/dome.ply -lv 0 --gtol 1e-6
+### `embed(mesh, target_edge_lengths, **opts) -> EmbedResult`
 
-to obtain the final deformed mesh result/dome_final.ply.
-Curvature distributions in violin plot are provided in png files.
-Furthermore, 
+Embed edge lengths into R^3 as vertex positions (PyTorch, L-BFGS).
 
-    python evaluation.py result/dome_final.ply
+| Parameter | Default | Description |
+|---|---|---|
+| `target_edge_lengths` | (required) | `dict` or `ndarray` of target lengths |
+| `lambda_boundary` | `0.01` | boundary position constraint weight |
+| `lambda_convexity` | `0.0` | soft convexity (z-monotonicity) weight |
+| `lambda_smoothness` | `0.0` | mean curvature smoothing weight |
+| `fix_scale` | `False` | fix global scale factor to 1 |
+| `optimizer` | `'LBFGS'` | `'LBFGS'`, `'Adam'`, `'SGD'` |
+| `device` | `'cpu'` | `'cpu'` or `'cuda'` |
+| `gtol` | `1e-6` | convergence tolerance |
 
-produces various error statistics.
+Returns `EmbedResult` with `.vertices`, `.scale_factor`, `.cost`, `.history`, `.mesh`.
 
-## with boundary fixed and uniform curvature for interior vertices
+### `curvature_flow(mesh, target_curvature, **opts) -> CurvatureFlowResult`
 
-    python ricci_flow.py dome.ply -lb -Ki 0.1
+Directly optimise vertex positions to achieve target curvatures. This is a single-stage alternative to `ricci_flow` + `embed`: simpler, but converges more slowly and does not preserve the conformal class. Best for small deformations or when direct vertex control is needed.
 
-reads mesh from dome.ply and performs Ricci flow with target curvature 0.1 for interior vertices, while leaving boundary vertices intact.
+| Parameter | Default | Description |
+|---|---|---|
+| `target_curvature` | `0.0` | same as `ricci_flow` |
+| `fixed_vertices` | boundary | vertices to keep fixed |
+| `fixed_positions` | from mesh | target positions for fixed vertices |
+| `lambda_boundary` | `0.0` | soft boundary position weight |
+| `strict_boundary` | `False` | hard-project fixed vertices each step |
+| `optimizer` | `'Adam'` | `'Adam'`, `'LBFGS'`, `'SGD'` |
+| `lr` | `1e-3` | learning rate |
+| `max_iter` | `1000` | maximum epochs |
+| `patience` | `50` | early stopping patience (0 to disable) |
+| `device` | `'cpu'` | `'cpu'` or `'cuda'` |
 
-The final result (mesh) is obtained by
+Returns `CurvatureFlowResult` with `.vertices`, `.curvature`, `.target_curvature`, `.history`, `.mesh`.
 
-    python metric_embed.py result/dome.ply --gtol 1e-6
+**When to use `curvature_flow` vs `ricci_flow` + `embed`:**
 
-## with boundary fixed, uniform curvature for interior vertices, and as regular as possible
+| | `ricci_flow` + `embed` | `curvature_flow` |
+|---|---|---|
+| Convergence | Guaranteed for admissible targets | May get stuck in local minima |
+| Conformal class | Preserved | Not preserved |
+| Speed | Fast (convex + non-convex split) | Slow (fully non-convex) |
+| Simplicity | Two-stage | Single function call |
 
-    python ricci_flow.py dome.ply -lb -Ki 0.1 -m combinatorial
+### Mesh I/O
 
-reads mesh from dome.ply and performs Ricci flow with target curvature 0.1 for interior vertices, while leaving boundary vertices intact.
-Instead of preserving the shape of faces, the metric is sought to make the faces as close as possible to equilateral triangles.
+```python
+mesh = TriangleMesh.from_ply('input.ply')
+mesh = TriangleMesh.from_obj('input.obj')
+mesh.save_ply('output.ply')
+mesh.save_ply('output.ply', vertex_colours=colours)
+```
 
-The final result (mesh) is obtained by
+### Visualisation
 
-    python metric_embed.py result/dome.ply --gtol 1e-6
+```python
+from ricci import plot_mesh, plot_curvature, plot_convergence, plot_comparison
 
+plot_mesh(mesh, show=True)
+plot_curvature(mesh, curvature_array, show=True)
+plot_convergence(result.history, show=True)
+plot_comparison([K_init, K_target, K_final], labels=['Init', 'Target', 'Final'], show=True)
+```
 
-## specified uniform curvature for interior vertices and uniform curvature for boundary
+## Examples
 
-    python ricci_flow.py dome.ply -Ki 0 
+### Fixed boundary, uniform curvature
 
-reads mesh from planar_grid.ply and performs Ricci flow with target curvature 0 for interior vertices and inferred uniform target curvature for boundary.
+```python
+result = ricci_flow(mesh, target_curvature=0.1, fix_boundary=True, scheme='combinatorial')
+embedded = embed(mesh, result.edge_lengths)
+```
 
-The final result is obtained by
+### Per-vertex curvature from CSV
 
-    python metric_embed.py result/dome.ply -lv 0
+```python
+result = ricci_flow(mesh, 'dome_targetK_hat.csv', method='trf')
+embedded = embed(mesh, result.edge_lengths, lambda_boundary=0)
+```
 
+CSV format: each row is `vertex_id, gaussian_curvature`. Vertices with K > 2pi or not listed are filled uniformly via the Gauss-Bonnet theorem.
 
-## without boundary
-Note that in the following, we try to find a torus with a constant curvature (which is zero).
-Recall that there is no flat torus in R^3, so the result will be distorted.
+### Closed surface (torus)
 
-    python ricci_flow.py torus.obj -m inversive -op newton
+```python
+torus = TriangleMesh.from_obj('demo/torus.obj')
+result = ricci_flow(torus, method='newton', scheme='inversive')
+embedded = embed(torus, result.edge_lengths, lambda_boundary=0)
+```
 
-reads mesh from torus.obj and deform its metric (edge length) by Ricci flow on inversive Circle Packing metric.
+### Convexity-enforced embedding
 
-    python ricci_flow.py torus.obj -m thurston -op newton
+```python
+embedded = embed(mesh, result.edge_lengths, lambda_convexity=1.0)
+```
 
-uses the Thurston's Circle Packing metric.
+### GPU acceleration
 
-    python ricci_flow.py torus.obj -m combinatorial -op newton
+```python
+embedded = embed(mesh, result.edge_lengths, device='cuda')
+```
 
-ignores the initial geometry and construct a circle packing purely combinatorially from the mesh.
+## Circle packing schemes
 
-The PLY file result/torus.ply is same as the (non-deformed) original mesh. 
-The final result is obtained by
+| Scheme | Description |
+|---|---|
+| `'combinatorial'` | Uniform edge weights; seeks equilateral triangles |
+| `'inversive'` | Preserves geometry via inversive distance |
+| `'thurston'` | Thurston's circle packing with averaged radii |
+| `'thurston2'` | Thurston's with fixed radius ratio |
+| `float` (e.g. `'0.5'`) | Constant edge weight |
+| CSV path | Load custom edge weights from file |
 
-    python metric_embed.py result/torus.ply -lv 0 --gtol 1e-6
+## Background
 
-to obtain the final deformed mesh result/torus_final.ply.
+The discrete Gaussian curvature at a vertex is the **angle defect**: 2pi minus the sum of incident face angles (pi minus the sum for boundary vertices). The Gauss-Bonnet theorem constrains the total curvature: sum(K) = 2pi * chi, where chi is the Euler characteristic.
 
-## Convexity enforced embedding
-By setting -lc 1 -m lm, a convex embedding is searched for:
+A **circle packing metric** parameterises edge lengths by per-vertex radii r_i and edge weights eta_{ij}:
 
-    python metric_embed.py result/dome.ply -lc 1
+    L_{ij} = sqrt(2 * r_i * r_j * eta_{ij} + r_i^2 + r_j^2)
 
-Here, convexity means that the z-value at every inner vertex is bigger than the average of the neighbouring vertices.
+The **conformal factor** u = log(r) lives in Euclidean space, making optimisation well-behaved. Ricci flow minimises the modified Ricci energy ||K(u) - K_target||^2 via scipy least-squares with analytical Jacobians.
 
-## Schemes for circle packing metric
+The **embedding** stage finds vertex positions matching the optimised edge lengths. This is a non-convex problem solved by PyTorch L-BFGS with automatic differentiation.
 
-Currently, thurston, thurston2, inversive, combinatorial are supported.
+## Dependencies
 
-For example,
-
-    python ricci_flow.py dome.ply -lb -Ki 0 -m 1.0 -e
-
-yields a final mesh dome_final.ply in the conformal class with a constant edge weight 1.0.
-
-## Direct optimisation of the metric without conformality
-The following optimise edge length directly to have the specified uniform curvature of 0.1 while fixing the boundary vertices.
-
-    python ricci_flow.py dome.ply -lb -Ki 0.1 -ot edge -e
-
-This is slower and allows no control on the conformal class.
-In most cases, the final embedding is not good since the triangle inequality is ignored.
-But it may offer better control over the boundary for certain cases.
-
-## Limitation
-
-Ricci flow converges to give a metric with target cuvatures if the target curvatures are _admissible_.
-
-# Some background
-
-The problem of finding a mesh with desired properties (such as specified curvatures)
-can often reduces to an optimisation problem.
-A straightforward way to design a cost function is to use vertex positions as free variables.
-However, such a cost function can have many local minima and hard to optimise.
-The two main ideas here are
-- splitting the optimisation into two stages: first, optimise the metric of the mesh and then optimise the vertex positions.
-- and the change of free variables: the metric can be determined by edge lengths, circle packing radii, or conformal factors.
-
-There can be different embeddings of a mesh with specified metric (edge lengths); Cauchy's rigidity holds only for convex meshes.
-On the other hand, a metric is (almost) uniquely determined by the curvature.
-The above splitting picks out the non-convex part.
-
-The space of feasible metrics is complicated ddue to the triangle inequality.
-On the other hand, the space of circle packing radius (resp. conformal factors) is Euclidean and suitable for optimisation.
-
-
-
-# Files
-
-The following intermediate files are produced by ricci_flow.py:
-- *_boundary.csv containing fixed boundary coordinates; each row consists of
-
-    id,  x,   y,   z
-
-- *_edge.csv containing edge lengths computed by the Ricci flow; each row consists of
-
-    id,  id,  length
-
-- *_targetCurvature.txt containing the target Gaussian curvature values for vertices
-- *_innerVertexID.txt containing the list of IDs of interior vertices
-- *_curvature_ricci.png showing the distribution of the curvature of free vertices computed from the metric found by the ricci flow
-
-The following intermediate files are produced by metric_embed.py:
-- *_edge_scaled.csv containing the uniformly scaled edge length found to meet the boundary constraint: it is obtained by multiplying a constant to values in *_edge.csv.
-- *_curvature_final.png showing the distribution of the curvature of free vertices of the final mesh
-
+- numpy, scipy
+- torch (>= 2.0)
+- plyfile
+- matplotlib, seaborn
