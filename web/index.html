@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f7f8">
+  <meta name="description" content="Prescribe curvature on a triangle mesh and watch its 3D shape evolve during discrete Ricci flow.">
+  <title>Ricci Flow Lab</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <header class="site-head">
+    <div class="shell head-inner">
+      <div class="brand"><canvas id="mark" width="72" height="72" aria-hidden="true"></canvas>Ricci Flow <b>Lab</b></div>
+      <nav aria-label="Help and source code">
+        <button id="helpOpen" class="nav-btn"><span data-icon="book"></span><span>User guide</span></button>
+        <span class="nav-separator"></span>
+        <a class="nav-btn" href="https://github.com/shizuo-kaji/ricci_flow"><span data-icon="code"></span><span>GitHub</span></a>
+      </nav>
+    </div>
+  </header>
+  <main class="shell">
+    <section class="intro">
+      <h1>Curvature flow explorer</h1>
+      <p>Set the target curvature of a triangle mesh and reconstruct its 3D shape from the resulting edge lengths.</p>
+    </section>
+    <div class="workspace">
+      <section class="viewport-panel" aria-labelledby="viewportTitle">
+        <div class="view-head">
+          <h2 id="viewportTitle"><span data-icon="cube"></span><span id="meshName">Torus</span></h2>
+          <div class="color-switch" aria-label="Mesh coloring">
+            <button id="colorMode" aria-pressed="true">Curvature</button>
+            <button id="deltaMode" aria-pressed="false" title="Show target angle defect minus input angle defect" hidden>Change</button>
+            <button id="plainMode" aria-pressed="false">Solid</button>
+          </div>
+        </div>
+        <div class="scene">
+          <canvas id="view" tabindex="0" role="img" aria-label="3D mesh. Drag or use the arrow keys to rotate. Scroll, pinch, or use the plus and minus keys to zoom."></canvas>
+          <div class="stage-label"><i></i><span id="frameTitle">Input shape</span></div>
+          <div class="view-tools">
+            <button id="wire" class="icon-btn" aria-label="Show mesh edges" aria-pressed="true" title="Show mesh edges"><span data-icon="mesh"></span></button>
+            <button id="zoomIn" class="icon-btn" aria-label="Zoom in" title="Zoom in"><span data-icon="plus"></span></button>
+            <button id="zoomOut" class="icon-btn" aria-label="Zoom out" title="Zoom out"><span data-icon="minus"></span></button>
+            <button id="fit" class="icon-btn" aria-label="Reset view" title="Reset view"><span data-icon="fit"></span></button>
+          </div>
+          <div id="legend" class="legend"><span><span id="legendTitle">Angle defect</span> <b>rad</b></span>
+            <div class="gradient"></div><div class="scale"><span id="legendMin">−</span><span>0</span><span id="legendMax">+</span></div>
+          </div>
+        </div>
+        <section id="paintControls" class="paint-controls" aria-label="Target curvature brush" hidden>
+          <div class="paint-row">
+            <div class="paint-tools" role="group" aria-label="Mesh interaction">
+              <button id="brushPaint" type="button" aria-pressed="true" title="Set the target curvature under the brush">Paint</button>
+              <button id="brushErase" type="button" aria-pressed="false" title="Release the vertices under the brush">Erase</button>
+              <button id="brushOrbit" type="button" aria-pressed="false" title="Drag to rotate the mesh">Orbit</button>
+            </div>
+            <div class="paint-fields">
+              <label class="brush-field" for="brushValue">Angle defect <span class="brush-number"><input id="brushValue" type="number" value="0.15" step="any" required><span>rad</span></span></label>
+              <label class="brush-field" for="brushRadius">Brush radius <span class="select-wrap"><select id="brushRadius">
+                <option value="0">Single vertex</option><option value="1" selected>1 edge ring</option><option value="2">2 edge rings</option><option value="3">3 edge rings</option><option value="4">4 edge rings</option>
+              </select></span></label>
+            </div>
+          </div>
+          <div class="paint-foot">
+            <p id="paintStatus" role="status">0 painted vertices</p>
+            <div class="paint-actions"><button id="undoPaint" type="button" disabled>Undo</button><button id="clearPaint" type="button" disabled>Clear</button></div>
+          </div>
+        </section>
+        <div class="mesh-foot">
+          <div class="mesh-counts"><span><b id="vertexCount">—</b> vertices</span><span><b id="faceCount">—</b> faces</span><span>χ <b id="chi">—</b></span></div>
+          <button id="export" class="quiet"><span data-icon="download"></span>Export PLY</button>
+        </div>
+        <div id="timeline" hidden>
+          <label for="frameIndex">Shape history</label><input id="frameIndex" type="range" min="0" max="1" value="0"><output id="frameNumber" for="frameIndex"></output>
+        </div>
+        <div class="star-check">
+          <button id="checkStars" class="quiet" type="button" aria-describedby="starScope">Check vertex stars</button>
+          <div id="starSummary" role="status"></div>
+        </div>
+      </section>
+      <aside class="settings panel" aria-labelledby="settingsTitle">
+        <div class="panel-title"><span class="title-icon" data-icon="settings"></span><h2 id="settingsTitle">Flow settings</h2></div>
+        <fieldset id="runInputs">
+          <div class="field">
+            <div class="field-line mesh-source">
+              <label for="sample">Input mesh</label>
+              <button class="outline" id="importMesh" type="button" title="Open a triangle mesh from your device"><span data-icon="upload"></span>Open PLY / OBJ</button>
+            </div>
+            <input id="meshFile" type="file" accept=".ply,.obj" hidden>
+            <div class="select-wrap"><select id="sample" aria-describedby="shapeDescription"></select></div>
+            <p id="shapeDescription" class="hint" hidden></p>
+          </div>
+          <div class="field">
+            <label for="target">Target Gaussian curvature</label>
+            <div class="select-wrap"><select id="target"><option value="uniform">Uniform curvature</option><option value="paint">Paint on mesh</option><option value="flat-interior">Flatten interior</option><option value="initial">Keep input curvature</option><option value="custom">Per-vertex values (CSV)</option></select></div>
+            <div id="customTarget" hidden>
+              <button id="importTarget" class="outline"><span data-icon="upload"></span><span id="targetFilename">Choose CSV</span></button>
+              <input id="targetFile" type="file" accept=".csv,.txt" hidden>
+              <p class="hint">Use two columns for vertex ID and angle defect in radians. Omitted vertices share the remaining curvature in each component.</p>
+            </div>
+            <button id="editPaint" class="outline" type="button" aria-controls="paintControls" hidden>Edit painted target</button>
+          </div>
+          <div class="field">
+            <label for="paintPreset">Paint preset</label>
+            <div class="input-row preset-row">
+              <div class="select-wrap"><select id="paintPreset" aria-describedby="patternDescription"><option value="">Choose a pattern</option></select></div>
+              <button id="applyPaintPreset" class="outline" type="button" aria-label="Apply paint preset" title="Replace the current painting. Undo restores it." disabled>Apply</button>
+            </div>
+            <p id="patternDescription" class="hint" hidden></p>
+          </div>
+          <div class="field strength">
+            <div class="field-line"><label for="strength">Target strength</label><output id="strengthValue" for="strength">75%</output></div>
+            <input type="range" id="strength" min="0" max="100" step="5" value="75">
+          </div>
+          <div class="divider"></div>
+          <div class="field">
+            <div class="preview-row">
+              <label for="preview">Preview intermediate shapes</label>
+              <input class="switch" id="preview" type="checkbox" role="switch">
+            </div>
+            <p class="hint">Reconstruct the shape at regular intervals. More frequent previews take longer.</p>
+            <div id="intervalRow" class="interval-row" hidden><label for="interval">Preview every</label><div><input type="number" id="interval" min="1" max="500" value="2" step="1" required><span>iterations</span></div></div>
+          </div>
+          <details id="advanced" class="advanced"><summary>Solver settings</summary>
+            <div class="pair"><label for="maxIter">Iteration limit</label><input type="number" id="maxIter" value="80" min="1" max="500" step="1" required></div>
+            <div class="pair"><label for="tolerance">Curvature tolerance</label><div class="select-wrap"><select id="tolerance"><option value="0.001">10⁻³ rad</option><option value="0.0001">10⁻⁴ rad</option><option value="0.00001" selected>10⁻⁵ rad</option><option value="0.000001">10⁻⁶ rad</option></select></div></div>
+            <div class="pair"><label for="bendingWeight">Bending weight</label><input type="number" id="bendingWeight" value="0" min="0" step="any" required aria-describedby="bendingHint"></div>
+            <div class="field fold-field">
+              <label for="bendingTarget">Preferred fold</label>
+              <div class="select-wrap"><select id="bendingTarget" disabled><option value="flat">Flat</option><option value="reference">Input dihedral angles</option></select></div>
+              <p class="hint" id="bendingHint">At zero, the shape fit uses edge lengths alone. Try 0.01 to favor the selected fold. Higher weights can increase edge-length error.</p>
+            </div>
+          </details>
+        </fieldset>
+        <p id="error" class="error" role="alert" hidden></p>
+        <button id="run" class="run"><span id="runIcon" data-icon="play"></span><span id="runLabel">Run optimization</span></button>
+      </aside>
+      <section class="diagnostics panel" aria-labelledby="diagTitle">
+        <div class="diag-head"><div class="panel-title"><span class="title-icon" data-icon="activity"></span><h2 id="diagTitle">Convergence</h2></div><span class="status" id="status" role="status">Ready</span></div>
+        <div class="metrics">
+          <div><span>Iteration</span><strong id="iteration">0</strong></div>
+          <div><span>Curvature error <small>RMS · rad</small></span><strong id="curvatureError">—</strong></div>
+          <div><span>Relative edge-length error <small>RMS</small></span><strong id="edgeError">—</strong></div>
+        </div>
+        <div id="plotRow" hidden><canvas id="plot" aria-label="RMS curvature error by iteration, with a logarithmic vertical axis." role="img"></canvas></div>
+        <p id="runNote" class="hint" hidden></p>
+      </section>
+    </div>
+  </main>
+  <dialog id="help"><div class="dialog-head"><h2>Using Ricci Flow Lab</h2><button id="helpClose" class="outline compact" aria-label="Close"><span data-icon="close"></span></button></div>
+    <ol><li><b>Choose a mesh</b><p>Select a built-in shape under <b>Input mesh</b>, or use <b>Open PLY / OBJ</b> to load a triangle mesh from your device. The reader accepts ASCII PLY, little- and big-endian binary PLY, and OBJ. For a polygon mesh, triangulate its faces before importing.</p></li>
+    <li><b>Set the target curvature</b><p>At 0% strength, the target equals the input curvature. At 100%, the solver uses the selected target. The angle defects on each connected component sum to 2πχ, where χ is its Euler characteristic.</p>
+    <p>For a starting pattern, choose a <b>Paint preset</b> and click <b>Apply</b>. The <b>Change</b> colours show where the pattern raises or lowers the input curvature. Choose <b>Target</b> to see the absolute angle defects. A preset replaces the current painting. Brush over it or use <b>Undo</b> to restore the previous painting. Patterns also work on imported meshes.</p>
+    <p>Choose <b>Paint on mesh</b> to set signed angle defects in radians at 100% strength. Enter a value and drag across the surface. Each edge ring adds one layer of neighboring vertices. Choose <b>Erase</b> to release painted vertices. Unpainted vertices share the adjustment needed to preserve their component’s total curvature. Target CSV files use zero-based vertex IDs.</p>
+    <p>While painting, hold Shift and drag to rotate, or select <b>Orbit</b> on a touch screen. Scroll or pinch to zoom.</p></li>
+    <li><b>Run the solver</b><p>Inversive-distance circle packing determines the edge lengths. A damped Gauss–Newton solve fits a 3D shape to those lengths. Enable intermediate previews to review individual iterations in the shape history.</p></li></ol>
+    <p class="dialog-note">Under Solver settings, a positive bending weight favors the selected dihedral angle across each interior edge. Choose Flat to encourage adjacent triangles to lie in the same plane, or Input dihedral angles to preserve the folds of the input mesh.</p>
+    <p class="dialog-note">Curvature error measures how closely the intrinsic angle defects match the target. Relative edge-length error measures how closely the reconstructed edges match the intrinsic lengths. When reviewing results, mesh colours show the angle defects of the displayed shape.</p>
+    <p class="dialog-note" id="starScope">Use <b>Check vertex stars</b> to look for local pinches in the triangles around each interior vertex of the displayed shape. Boundary vertices and global self-intersections fall outside the scope of this check.</p>
+    <p class="dialog-note">Drag to rotate. Scroll or pinch to zoom. With the viewer focused, use the arrow keys to rotate and the plus and minus keys to zoom.</p>
+  </dialog>
+</body>
+</html>

@@ -15,9 +15,13 @@ class EmbedResult:
     Attributes:
         vertices: (N, 3) embedded vertex positions.
         scale_factor: global scaling factor applied to squared edge lengths.
-        cost: final edge-length residual.
+        cost: final solver cost (includes active penalties for the PyTorch solver).
         history: per-iteration or per-stage objective values.
         mesh: new TriangleMesh with embedded vertex positions.
+        relative_edge_rms: unweighted RMS of actual / target - 1 over all edges.
+            The target length includes sqrt(scale_factor). A value of 0.01
+            corresponds to 1% RMS error. Empty meshes return zero. A nonpositive
+            or nonfinite fitted scale gives infinity.
     """
 
     vertices: np.ndarray
@@ -25,6 +29,7 @@ class EmbedResult:
     cost: float
     history: list = field(default_factory=list)
     mesh: TriangleMesh = None
+    relative_edge_rms: float = float("nan")
 
 
 def prepare_edge_data(
@@ -100,3 +105,14 @@ def edge_residual_cost(
     actual_len_sq = np.sum(diff * diff, axis=1)
     residuals = weights * (actual_len_sq - scale_factor * target_lengths**2)
     return float(np.sum(residuals**2))
+
+
+def relative_edge_rms(mesh: TriangleMesh, target_lengths: np.ndarray, *, scale_factor: float) -> float:
+    """Measure unweighted relative length errors on the realized mesh."""
+    if not mesh.edges:
+        return 0.0
+    if scale_factor <= 0 or not np.isfinite(scale_factor):
+        return float("inf")
+    actual = np.fromiter((mesh.edge_lengths[e] for e in mesh.edges), dtype=float, count=mesh.n_edges)
+    relative_errors = actual / target_lengths / np.sqrt(scale_factor) - 1.0
+    return float(np.sqrt(np.mean(relative_errors**2)))

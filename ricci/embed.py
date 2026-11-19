@@ -1,35 +1,16 @@
-"""Embed edge lengths into R^3.
+"""Embed target edge lengths into R^3.
 
-Given target edge lengths (e.g. from Ricci flow), find vertex positions
-in 3D that realise those lengths subject to boundary, convexity, and
-smoothness constraints. Uses PyTorch autograd for gradient computation.
+This module keeps the original optimisation-based embedding path and also
+dispatches to alternative embedding methods such as ``shape_from_metric``.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-from dataclasses import dataclass, field
 from typing import Optional, Union
 
+from ._embed_common import EmbedResult, prepare_edge_data, prepare_edge_weights, relative_edge_rms
 from .mesh import TriangleMesh
-
-
-@dataclass
-class EmbedResult:
-    """Result of metric embedding.
-
-    Attributes:
-        vertices: (N, 3) optimised vertex positions.
-        scale_factor: optimised global scaling factor (beta).
-        cost: final loss value.
-        history: per-iteration loss values.
-        mesh: new TriangleMesh with optimised vertex positions.
-    """
-    vertices: np.ndarray
-    scale_factor: float
-    cost: float
-    history: list = field(default_factory=list)
-    mesh: TriangleMesh = None
 
 
 class _EmbedModel(nn.Module):
@@ -150,7 +131,7 @@ class _EmbedModel(nn.Module):
         return loss
 
 
-def embed(
+def _embed_optimization(
     mesh: TriangleMesh,
     target_edge_lengths: Union[dict, np.ndarray],
     *,
@@ -170,7 +151,7 @@ def embed(
     device: str = 'cpu',
     verbose: int = 1,
 ) -> EmbedResult:
-    """Embed a discrete metric into R^3.
+    """Embed a discrete metric into R^3 by direct optimisation.
 
     Given target edge lengths, finds 3D vertex positions that realise
     those lengths. Uses PyTorch L-BFGS with strong Wolfe line search
@@ -203,19 +184,17 @@ def embed(
     dev = torch.device(device)
 
     # Prepare edge arrays
-    edges_arr = np.array([[min(e), max(e)] for e in mesh.edges], dtype=np.int64)
-    if isinstance(target_edge_lengths, dict):
-        lengths_arr = np.array([target_edge_lengths[frozenset(e)] for e in edges_arr])
-    else:
-        lengths_arr = np.asarray(target_edge_lengths, dtype=np.float64)
+    edges_arr, lengths_arr = prepare_edge_data(mesh, target_edge_lengths)
 
-    if edge_weights is None:
-        ew = np.ones(len(edges_arr))
-    else:
-        ew = np.asarray(edge_weights, dtype=np.float64)
+    ew = prepare_edge_weights(len(edges_arr), edge_weights)
+    if not isinstance(max_iter, (int, np.integer)) or max_iter < 0:
+        raise ValueError("max_iter must be a non-negative integer")
 
     # Initial positions
     verts = mesh.vertices.copy() if initial_positions is None else initial_positions.copy()
+    if mesh.n_vertices == 0:
+        empty_mesh = mesh.with_vertices(verts)
+        return EmbedResult(empty_mesh.vertices, 1.0, 0.0, [0.0], empty_mesh, relative_edge_rms=0.0)
 
     # Boundary
     fv = fixed_vertices
@@ -294,16 +273,127 @@ def embed(
 
     final_verts = model.coords.detach().cpu().numpy()
     beta = model.beta.item()
+    # The recorded closure value precedes the parameter update, including for L-BFGS.
+    with torch.no_grad():
+        final_cost = model.total_loss(lambda_boundary, lambda_convexity, lambda_smoothness).item()
+    if history:
+        history[-1] = final_cost
+    else:
+        history.append(final_cost)
 
     if verbose >= 1:
-        print(f"  cost={lv:.8e}, beta={beta:.6f}, iters={it+1}")
+        print(f"  cost={final_cost:.8e}, beta={beta:.6f}")
 
     result_mesh = mesh.with_vertices(final_verts)
 
     return EmbedResult(
         vertices=final_verts,
         scale_factor=beta,
-        cost=lv,
+        cost=final_cost,
         history=history,
         mesh=result_mesh,
+        relative_edge_rms=relative_edge_rms(result_mesh, lengths_arr, scale_factor=beta),
+    )
+
+
+def embed(
+    mesh: TriangleMesh,
+    target_edge_lengths: Union[dict, np.ndarray],
+    *,
+    initial_positions: Optional[np.ndarray] = None,
+    fixed_vertices: Optional[np.ndarray] = None,
+    fixed_positions: Optional[np.ndarray] = None,
+    vertex_weights: Optional[np.ndarray] = None,
+    edge_weights: Optional[np.ndarray] = None,
+    lambda_boundary: float = 0.01,
+    lambda_convexity: float = 0.0,
+    lambda_smoothness: float = 0.0,
+    bending_weight: float = 0.0,
+    bending_target: str = 'flat',
+    fix_scale: bool = False,
+    optimizer: str = 'LBFGS',
+    lr: float = 0.1,
+    max_iter: int = 2000,
+    gtol: float = 1e-6,
+    device: str = 'cpu',
+    verbose: int = 1,
+    method: str = 'shape_from_metric',
+) -> EmbedResult:
+    """Embed a discrete metric into R^3.
+
+    Args:
+        mesh: TriangleMesh providing connectivity and initial positions.
+        target_edge_lengths: target lengths, either:
+            - dict mapping frozenset edge -> length, or
+            - ndarray matching the order of mesh.edges.
+        initial_positions: (N, 3) starting positions or alignment reference.
+        fixed_vertices: indices of fixed boundary vertices.
+        fixed_positions: (F, 3) target positions for fixed vertices.
+        vertex_weights: (F,) per-vertex boundary constraint weights.
+        edge_weights: per-edge weights (default: uniform).
+        lambda_boundary: weight for boundary position constraint.
+        lambda_convexity: weight for convexity (z-monotonicity) constraint.
+        lambda_smoothness: weight for mean-curvature smoothness.
+        bending_weight: non-negative strength of the shape-from-metric hinge energy.
+        bending_target: 'flat' or 'reference' (dihedral angles of mesh.vertices).
+        fix_scale: if True, fix the global scale factor to 1.
+        optimizer: optimisation backend for ``method='optimization'``.
+        lr: learning rate.
+        max_iter: maximum iterations.
+        gtol: convergence tolerance.
+        device: 'cpu' or 'cuda'.
+        verbose: 0=silent, 1=summary, 2=progress.
+        method: ``'optimization'`` or ``'shape_from_metric'`` (default).
+
+    Returns:
+        EmbedResult with embedded vertex positions and metadata.
+    """
+
+    method_name = method.lower()
+
+    if method_name in {'optimization', 'optimisation'}:
+        if bending_weight != 0 or bending_target != 'flat':
+            raise ValueError("bending options require method='shape_from_metric'")
+        return _embed_optimization(
+            mesh,
+            target_edge_lengths,
+            initial_positions=initial_positions,
+            fixed_vertices=fixed_vertices,
+            fixed_positions=fixed_positions,
+            vertex_weights=vertex_weights,
+            edge_weights=edge_weights,
+            lambda_boundary=lambda_boundary,
+            lambda_convexity=lambda_convexity,
+            lambda_smoothness=lambda_smoothness,
+            fix_scale=fix_scale,
+            optimizer=optimizer,
+            lr=lr,
+            max_iter=max_iter,
+            gtol=gtol,
+            device=device,
+            verbose=verbose,
+        )
+
+    if method_name in {'shape_from_metric', 'shape-from-metric', 'sfm', 'local-global'}:
+        from .shape_from_metric import shape_from_metric
+
+        return shape_from_metric(
+            mesh,
+            target_edge_lengths,
+            initial_positions=initial_positions,
+            fixed_vertices=fixed_vertices,
+            fixed_positions=fixed_positions,
+            vertex_weights=vertex_weights,
+            edge_weights=edge_weights,
+            lambda_boundary=lambda_boundary,
+            fix_scale=fix_scale,
+            bending_weight=bending_weight,
+            bending_target=bending_target,
+            max_iter=max_iter,
+            gtol=gtol,
+            verbose=verbose,
+        )
+
+    raise ValueError(
+        "method must be 'optimization' or 'shape_from_metric'"
     )

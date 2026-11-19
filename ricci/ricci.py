@@ -7,10 +7,24 @@ specification and returns optimised edge lengths.
 import os
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Union, Optional
+from numbers import Integral, Real
+from typing import Callable, Optional, Union
 
 from .mesh import TriangleMesh
-from .metric import DiscreteMetric, CirclePackingMetric, _ricci_energy
+from .metric import DiscreteMetric, CirclePackingMetric
+from .shape_from_metric import shape_from_metric
+from ._embed_common import EmbedResult
+
+
+@dataclass
+class RicciFlowPreview:
+    """One reconstructed metric at an accepted flow iteration."""
+
+    iteration: int
+    curvature_error: float
+    edge_lengths: dict
+    shape: EmbedResult
+    curvature: np.ndarray
 
 
 @dataclass
@@ -25,6 +39,8 @@ class RicciFlowResult:
         history: convergence history (list of error values).
         circle_packing: the CirclePackingMetric after optimisation.
         mesh: the input mesh.
+        previews: retained snapshots when previewing without a callback.
+        skipped_preview_iterations: intermediate states without valid triangles.
     """
     edge_lengths: dict
     curvature: np.ndarray
@@ -33,59 +49,48 @@ class RicciFlowResult:
     history: list = field(default_factory=list)
     circle_packing: CirclePackingMetric = None
     mesh: TriangleMesh = None
+    previews: list = field(default_factory=list)
+    skipped_preview_iterations: list = field(default_factory=list)
 
 
-def _parse_target_curvature(mesh, target, fix_boundary):
-    """Parse target curvature specification into a per-vertex array.
-
-    Args:
-        mesh: TriangleMesh
-        target: float, ndarray, or path to CSV file.
-            - float: uniform target for interior vertices; boundary inferred.
-            - ndarray of length N: per-vertex target.
-            - str: path to CSV with rows (vertex_id, curvature).
-              Vertices with K > 2*pi are "free" (determined by Gauss-Bonnet).
-        fix_boundary: if True, boundary curvature stays unchanged.
-
-    Returns:
-        (K, specified_verts, free_verts) where K is (N,) target array,
-        specified_verts are vertices with specified curvature, and
-        free_verts are vertices whose conformal factor can vary.
-    """
+def _parse_target_curvature(mesh, target, fix_boundary, initial_curvature=None):
+    """Expand scalar, vertex-array or CSV targets and fill free angle defects."""
     n = mesh.n_vertices
-    K = np.full(n, 4 * np.pi)  # sentinel: > 2*pi means "unspecified"
-
-    if isinstance(target, (int, float)):
+    K = np.full(n, 4 * np.pi)
+    if isinstance(target, Real):
         K[mesh.interior_vertices] = target
-    elif isinstance(target, np.ndarray) and target.ndim == 1 and len(target) == n:
-        K = target.copy()
-    elif isinstance(target, str) and os.path.isfile(target):
-        tc = np.loadtxt(target, delimiter=",")
-        K[tc[:, 0].astype(int)] = tc[:, 1]
+    elif isinstance(target, (str, os.PathLike)):
+        rows = np.loadtxt(target, delimiter=",", ndmin=2)
+        if rows.shape[1] != 2:
+            raise ValueError("curvature CSV rows must contain vertex_id,curvature")
+        ids = rows[:, 0]
+        if not np.all(np.isfinite(ids) & (ids == np.floor(ids)) & (ids >= 0) & (ids < n)):
+            raise ValueError("curvature CSV contains an invalid vertex_id")
+        K[ids.astype(np.intp)] = rows[:, 1]
     else:
-        raise ValueError(f"Cannot parse target_curvature: {target}")
-
-    # Magic: K == 100 means keep initial curvature (handled later)
-    # Unspecified (K > 2*pi): fill uniformly via Gauss-Bonnet
-    free_K = K > 2 * np.pi
-    if free_K.sum() > 0:
-        specified_sum = K[~free_K].sum()
-        uniform_K = (2 * mesh.euler_characteristic * np.pi - specified_sum) / free_K.sum()
-        K[free_K] = uniform_K
-
-    # Which vertices have target curvature specified
-    if fix_boundary:
-        specified_verts = mesh.interior_vertices
-        free_verts = mesh.interior_vertices
-    else:
-        specified_verts = list(range(n))
-        free_verts = list(range(n))
-
-    # Override with CSV-specified vertices if available
-    if isinstance(target, str):
-        specified_verts = list(np.where(K < 2 * np.pi)[0])
-
-    return K, specified_verts, free_verts
+        K = np.array(target, dtype=np.float64, copy=True)
+        if K.shape != (n,):
+            raise ValueError(f"target_curvature must contain {n} values")
+    if not np.isfinite(K).all():
+        raise ValueError("target_curvature must be finite")
+    keep = K == 100
+    if np.any(keep):
+        if initial_curvature is None:
+            initial_curvature = DiscreteMetric(mesh, mesh.edge_lengths).gaussian_curvature
+        K[keep] = initial_curvature[keep]
+    free = K > 2 * np.pi
+    if np.any(free):
+        # Each connected component has its own Gauss-Bonnet constraint.
+        if initial_curvature is None:
+            initial_curvature = DiscreteMetric(mesh, mesh.edge_lengths).gaussian_curvature
+        for indices in mesh.connected_components:
+            missing = free[indices]
+            if np.any(missing):
+                K[indices[missing]] = (
+                    initial_curvature[indices].sum() - K[indices[~missing]].sum()
+                ) / missing.sum()
+    vertices = mesh.interior_vertices if fix_boundary else list(range(n))
+    return K, vertices, vertices
 
 
 def ricci_flow(
@@ -101,6 +106,10 @@ def ricci_flow(
     lr: float = 0.1,
     gtol: float = 1e-6,
     verbose: int = 1,
+    max_iter: Optional[int] = None,
+    preview_every: int = 0,
+    on_preview: Optional[Callable[[RicciFlowPreview], None]] = None,
+    preview_options: Optional[dict] = None,
 ) -> RicciFlowResult:
     """Run discrete Ricci flow on a triangle mesh.
 
@@ -121,7 +130,8 @@ def ricci_flow(
         scheme: circle packing scheme.
             'inversive', 'thurston', 'thurston2', 'combinatorial',
             a float value for constant eta, or a CSV file path.
-        fix_boundary: if True, keep boundary radii unchanged.
+        fix_boundary: prescribe interior curvature only. SGD/Newton also
+            hold boundary radii fixed. TRF/LM use soft boundary constraints.
         boundary_constraint: 'edge' to preserve boundary edge lengths,
             'radius' to preserve boundary radii.
         boundary_weight: weight for boundary constraints.
@@ -129,20 +139,40 @@ def ricci_flow(
         lr: learning rate for sgd/newton methods.
         gtol: gradient tolerance for convergence.
         verbose: 0=silent, 1=summary, 2=progress.
+        max_iter: iteration budget for gradient/Newton flow, or maximum SciPy
+            function evaluations for TRF/LM. None keeps the solver default.
+        preview_every: reconstruct every N accepted steps and at the final metric.
+            Zero disables all shape reconstruction.
+        on_preview: receive each RicciFlowPreview during the solve. Without a
+            callback, enabled snapshots are collected in result.previews.
+        preview_options: keyword arguments for shape_from_metric. Each preview
+            after the first starts from the preceding reconstructed shape.
 
     Returns:
         RicciFlowResult with optimised edge lengths, curvature, etc.
     """
-    # Build initial metric
+    if isinstance(preview_every, bool) or not isinstance(preview_every, Integral) or preview_every < 0:
+        raise ValueError("preview_every must be a non-negative integer")
+    if on_preview is not None and (not callable(on_preview) or not preview_every):
+        raise ValueError("on_preview requires a callable and a positive preview_every")
+    if max_iter is not None and (not isinstance(max_iter, Integral) or max_iter < 1):
+        raise ValueError("max_iter must be a positive integer")
+    if not np.isfinite(gtol) or gtol <= 0:
+        raise ValueError("gtol must be positive and finite")
+    if method not in ('sgd', 'newton', 'trf', 'lm'):
+        raise ValueError(f"Unknown flow method: {method}")
+    if method in ('sgd', 'newton') and (not np.isfinite(lr) or lr <= 0):
+        raise ValueError("lr must be positive and finite")
+    if boundary_constraint not in ('edge', 'radius') or not np.isfinite(boundary_weight) or boundary_weight < 0:
+        raise ValueError("use an edge or radius boundary constraint with a non-negative finite weight")
+    if not mesh.n_faces or any(not row for row in mesh.adjacency):
+        raise ValueError("Ricci flow requires triangles incident to every vertex")
+
     g = DiscreteMetric(mesh, mesh.edge_lengths)
-
-    # Parse target curvature
+    if not g.is_valid:
+        raise ValueError("the input mesh contains a degenerate triangle")
     K, specified_verts, free_verts = _parse_target_curvature(
-        mesh, target_curvature, fix_boundary)
-
-    # Handle K == 100 (magic number: keep initial curvature)
-    keep_mask = (K == 100)
-    K[keep_mask] = g.gaussian_curvature[keep_mask]
+        mesh, target_curvature, fix_boundary, g.gaussian_curvature)
 
     if verbose > 0:
         chi = mesh.euler_characteristic
@@ -153,6 +183,8 @@ def ricci_flow(
 
     # Build circle packing metric
     cp = CirclePackingMetric.from_metric(g, scheme=scheme, alpha=alpha)
+    if not cp.is_valid:
+        raise ValueError("the selected circle packing produces an invalid initial metric")
     if verbose > 0:
         print(f"scale_factor = {cp.scale_factor:.6f}")
 
@@ -161,33 +193,66 @@ def ricci_flow(
     init_boundary_len /= cp.scale_factor
     init_u = cp.u.copy()
 
-    # Run optimisation
-    if method == 'sgd':
-        history = cp.run_gradient_descent(
-            K, free_verts, dt=lr, gtol=gtol,
-            use_hessian=False, verbose=verbose)
-    elif method == 'newton':
-        history = cp.run_gradient_descent(
-            K, free_verts, dt=lr, gtol=gtol,
-            use_hessian=True, verbose=verbose)
+    history = [float(np.abs((cp.gaussian_curvature - K)[specified_verts]).sum())]
+    previous_u = init_u.copy()
+    preview_iteration = -1
+    previews = []
+    skipped_previews = []
+    options = dict(preview_options or {})
+    options.setdefault("verbose", 0)
+    if options.get("fixed_vertices") is not None and options.get("fixed_positions") is None:
+        options["fixed_positions"] = mesh.vertices[np.asarray(options["fixed_vertices"], dtype=np.intp)]
+
+    def reconstruct(u):
+        nonlocal preview_iteration
+        lengths = cp.scaled_edge_lengths(u)
+        metric = DiscreteMetric(mesh, lengths)
+        iteration = len(history) - 1
+        if not metric.is_valid:
+            # The extended-angle least-squares objective allows a trial to
+            # cross a degenerate triangle. It has no spatial realization.
+            skipped_previews.append(iteration)
+            return
+        shape = shape_from_metric(mesh, lengths, **options)
+        options["initial_positions"] = shape.vertices.copy()
+        preview_iteration = iteration
+        snapshot = RicciFlowPreview(iteration, history[-1], lengths, shape, metric.gaussian_curvature)
+        if on_preview is None:
+            previews.append(snapshot)
+        else:
+            on_preview(snapshot)
+
+    def record(u, error):
+        nonlocal previous_u
+        if np.array_equal(u, previous_u):
+            return
+        history.append(error)
+        previous_u = u.copy()
+        if preview_every and (len(history) - 1) % preview_every == 0:
+            reconstruct(u)
+
+    if method in ('sgd', 'newton'):
+        cp.run_gradient_descent(
+            K, free_verts, dt=lr, gtol=gtol, use_hessian=(method == 'newton'),
+            verbose=verbose, max_iter=max_iter or 100000, on_accept=record)
     else:
-        no_jac = (method == 'lm')
-        target_l = init_boundary_len if boundary_constraint == 'edge' else None
-        target_u = init_u if boundary_constraint == 'radius' else None
         cp.run_least_squares(
             K, specified_verts, free_verts,
-            target_u=target_u, target_lengths=target_l,
+            target_u=init_u if boundary_constraint == 'radius' else None,
+            target_lengths=init_boundary_len if boundary_constraint == 'edge' else None,
             boundary_weight=boundary_weight, opt_target='conformal_factor',
-            method=method, gtol=gtol, no_jacobian=no_jac, verbose=verbose)
-        history = []
+            method=method, gtol=gtol, verbose=verbose, on_accept=record, max_nfev=max_iter)
 
-    # Collect results
-    edge_lengths = {}
-    for edge in mesh.edges:
-        i, j = edge
-        edge_lengths[edge] = cp.scale_factor * cp._l[i, j]
-
-    curvature_mae = np.abs(cp.gaussian_curvature[specified_verts] - K[specified_verts]).mean()
+    if not cp.is_valid:
+        raise ValueError("the final metric violates the strict triangle inequalities")
+    final_error = float(np.abs((cp.gaussian_curvature - K)[specified_verts]).sum())
+    record(cp.u, final_error)
+    if preview_every and preview_iteration != len(history) - 1:
+        reconstruct(cp.u)
+        if preview_iteration != len(history) - 1:
+            raise ValueError("the final edge lengths in input units violate the triangle inequalities")
+    edge_lengths = cp.scaled_edge_lengths()
+    curvature_mae = final_error / max(1, len(specified_verts))
     if verbose > 0:
         print(f"curvature MAE = {curvature_mae:.6e}")
 
@@ -199,4 +264,6 @@ def ricci_flow(
         history=history,
         circle_packing=cp,
         mesh=mesh,
+        previews=previews,
+        skipped_preview_iterations=skipped_previews,
     )

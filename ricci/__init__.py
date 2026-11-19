@@ -14,20 +14,26 @@ Typical usage::
 """
 
 from .mesh import TriangleMesh
+from .immersion import ImmersionDiagnostics, immersion_diagnostics
 from .metric import DiscreteMetric, CirclePackingMetric
-from .ricci import ricci_flow, RicciFlowResult
+from .ricci import ricci_flow, RicciFlowPreview, RicciFlowResult
 from .embed import embed, EmbedResult
+from .shape_from_metric import shape_from_metric
 from .curvature_flow import curvature_flow, CurvatureFlowResult
 from .viz import plot_mesh, plot_curvature, plot_convergence, plot_comparison
 
 __all__ = [
     'TriangleMesh',
+    'ImmersionDiagnostics',
+    'immersion_diagnostics',
     'DiscreteMetric',
     'CirclePackingMetric',
     'ricci_flow',
     'RicciFlowResult',
+    'RicciFlowPreview',
     'embed',
     'EmbedResult',
+    'shape_from_metric',
     'curvature_flow',
     'CurvatureFlowResult',
     'plot_mesh',

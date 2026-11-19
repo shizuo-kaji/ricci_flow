@@ -7,7 +7,7 @@ adjacency computation, and edge length extraction.
 import numpy as np
 from numpy.linalg import norm
 from itertools import combinations
-from functools import reduce
+from functools import cached_property
 from plyfile import PlyData, PlyElement
 
 
@@ -35,13 +35,16 @@ def _read_obj(path):
     faces = []
     with open(path) as f:
         for line in f:
-            tok = line.split()
+            tok = line.partition("#")[0].split()
             if not tok or tok[0] == "#":
                 continue
             elif tok[0] == "v":
-                verts.append([float(x) for x in tok[1:]])
+                verts.append([float(x) for x in tok[1:4]])
             elif tok[0] == "f":
-                poly = [int(s.split("/")[0]) - 1 for s in tok[1:]]
+                indices = [int(s.split("/")[0]) for s in tok[1:]]
+                if 0 in indices:
+                    raise ValueError("OBJ vertex indices start at 1")
+                poly = [i - 1 if i > 0 else len(verts) + i for i in indices]
                 faces.append(poly)
     return np.array(verts, dtype=np.float64), faces
 
@@ -71,49 +74,49 @@ class TriangleMesh:
         """
         self.vertices = np.asarray(vertices, dtype=np.float64)
 
-        # Triangulate and store as frozensets
+        if self.vertices.size == 0:
+            self.vertices = self.vertices.reshape(0, 3)
+        if self.vertices.ndim != 2 or self.vertices.shape[1] != 3 or not np.isfinite(self.vertices).all():
+            raise ValueError("vertices must be a finite (N, 3) array")
+
+        # Keep the input winding for export, and the legacy unordered faces
+        # and edge enumeration for metric arrays supplied by existing callers.
         self.faces = []
+        triangles = []
+        edge_counts = {}
+        self._adjacent_faces = [[] for _ in self.vertices]
+        neighbours = [set() for _ in self.vertices]
         for poly in faces:
-            self.faces.extend([frozenset(f) for f in _triangulate(poly)])
+            poly = tuple(poly)
+            if len(poly) < 3:
+                raise ValueError("faces must have at least three vertices")
+            for tri in _triangulate(poly):
+                face = frozenset(tri)
+                if (len(face) != 3 or any(not isinstance(v, (int, np.integer)) for v in tri)
+                        or min(tri) < 0 or max(tri) >= len(self.vertices)):
+                    raise ValueError("triangles must reference three distinct valid vertex indices")
+                self.faces.append(face)
+                triangles.append(tri)
+                for v in tri:
+                    self._adjacent_faces[v].append(face)
+                for i, j in combinations(face, 2):
+                    edge = frozenset((i, j))
+                    edge_counts[edge] = edge_counts.get(edge, 0) + 1
+                    neighbours[i].add(j)
+                    neighbours[j].add(i)
+        self.triangles = np.asarray(triangles, dtype=np.intp).reshape(-1, 3)
+        self.edges = list(edge_counts)
+        self._edge_indices = np.asarray([tuple(e) for e in self.edges], dtype=np.intp).reshape(-1, 2)
+        self.edge_lengths = self._measure_edges(self.vertices)
+        self.boundary_edges = [e for e, count in edge_counts.items() if count == 1]
+        boundary = {v for e in self.boundary_edges for v in e}
+        self.boundary_vertices = sorted(boundary)
+        self.interior_vertices = [v for v in range(self.n_vertices) if v not in boundary]
+        self.adjacency = [sorted(row) for row in neighbours]
 
-        # Build edges, lengths, and detect boundary
-        edge_list = []
-        lengths = {}
-        boundary_edges = []
-        for face in self.faces:
-            for edge in combinations(face, 2):
-                edge = frozenset(edge)
-                if edge not in edge_list:
-                    i, j = edge
-                    edge_list.append(edge)
-                    lengths[edge] = norm(self.vertices[i] - self.vertices[j])
-                    boundary_edges.append(edge)
-                else:
-                    if edge in boundary_edges:
-                        boundary_edges.remove(edge)
-
-        self.edges = edge_list
-        self.edge_lengths = lengths
-        self.boundary_edges = boundary_edges
-
-        if boundary_edges:
-            self.boundary_vertices = sorted(
-                list(reduce(lambda a, b: a.union(b), boundary_edges)))
-        else:
-            self.boundary_vertices = []
-
-        all_verts = list(range(len(self.vertices)))
-        self.interior_vertices = [v for v in all_verts if v not in set(self.boundary_vertices)]
-
-        # Adjacency: per-vertex list of adjacent faces and neighbours
-        self._adjacent_faces = [
-            [f for f in self.faces if v in f] for v in all_verts]
-        self.adjacency = [
-            sorted(set(
-                np.array([list(f) for f in self._adjacent_faces[v]]).flatten().astype(int)
-            ) - {v})
-            for v in all_verts
-        ]
+    def _measure_edges(self, vertices):
+        i, j = self._edge_indices.T
+        return dict(zip(self.edges, norm(vertices[i] - vertices[j], axis=1)))
 
     @classmethod
     def from_ply(cls, path):
@@ -140,7 +143,7 @@ class TriangleMesh:
             path: output file path.
             vertex_colours: optional (N, 3) or (N, 4) uint8 array of RGB(A) colours.
         """
-        nf = len(list(self.faces[0]))
+        nf = 3
         if vertex_colours is None:
             el1 = PlyElement.describe(
                 np.array([(v[0], v[1], v[2]) for v in self.vertices],
@@ -154,22 +157,19 @@ class TriangleMesh:
                                 ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]),
                 'vertex')
         face_arr = np.array(
-            [(list(f), 0) for f in self.faces],
+            [(f, 0) for f in self.triangles],
             dtype=[('vertex_indices', 'i4', (nf,)), ('red', 'u1')])
         el2 = PlyElement.describe(face_arr, 'face')
         PlyData([el1, el2], text=True).write(path)
 
     def with_vertices(self, new_vertices):
         """Return a new mesh with the same connectivity but different vertex positions."""
-        face_tuples = [tuple(sorted(f)) for f in self.faces]
         m = TriangleMesh.__new__(TriangleMesh)
         m.__dict__.update(self.__dict__)
         m.vertices = np.asarray(new_vertices, dtype=np.float64)
-        # Recompute edge lengths
-        m.edge_lengths = {}
-        for edge in self.edges:
-            i, j = edge
-            m.edge_lengths[edge] = norm(m.vertices[i] - m.vertices[j])
+        if m.vertices.shape != self.vertices.shape or not np.isfinite(m.vertices).all():
+            raise ValueError("new_vertices must be finite and match the original shape")
+        m.edge_lengths = self._measure_edges(m.vertices)
         return m
 
     @property
@@ -187,6 +187,24 @@ class TriangleMesh:
     @property
     def euler_characteristic(self):
         return self.n_vertices - self.n_edges + self.n_faces
+
+    @cached_property
+    def connected_components(self):
+        """Vertex indices for each connected component, including isolated vertices."""
+        seen = np.zeros(self.n_vertices, dtype=bool)
+        groups = []
+        for start in range(self.n_vertices):
+            if seen[start]:
+                continue
+            group = [start]
+            seen[start] = True
+            for vertex in group:
+                for neighbour in self.adjacency[vertex]:
+                    if not seen[neighbour]:
+                        seen[neighbour] = True
+                        group.append(neighbour)
+            groups.append(np.array(group, dtype=np.intp))
+        return groups
 
     def adjacent_faces(self, vertex):
         """Return faces adjacent to a vertex."""
