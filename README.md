@@ -29,10 +29,6 @@ The web app lives in [web/](web/). To run it locally, start the following comman
 python -m http.server 8000 --bind 127.0.0.1 --directory web
 ```
 
-To publish the demo, select **GitHub Actions** under **Settings → Pages → Build and deployment → Source**. Changes to `web/` on `master` trigger deployment to the project site. You can also run the workflow from the **Actions** tab. [Deployment workflow](.github/workflows/pages.yml)
-
-The browser worker evolves an inversive-distance circle packing by damped Newton steps on a fixed triangulation. It fits 3D coordinates by minimizing relative edge-length residuals. The curvature RMS in radians measures the **intrinsic metric** against the target. The relative edge RMS measures the **displayed reconstruction** against that metric. Shape history colours each reconstruction by its measured angle defect. The final browser fit starts from the input mesh for reproducibility across preview intervals.
-
 ## Installation
 
 ```sh
